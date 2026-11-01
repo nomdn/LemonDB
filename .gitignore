@@ -31,3 +31,5 @@ scanner/restart_v4*.sh
 scanner/resume_v4.sh
 scanner/probe_v6*.py
 topup_v6.py
+scanner/scan16
+scanner/r4list.txt
