@@ -1,0 +1,41 @@
+name: fetch-dbs
+description: 下载 dbs/ 依赖库（链接取自 ipw-cn 的 src/ipdb/ipdb.go 同款下载表），按月缓存
+
+# 依赖库体积大（约 300MB），授权各异（MaxMind / IP2Location / GeoCN / ip2region），
+# 既不能进仓库也不该手工挂 release：直接把 ipw-cn 生产环境日更用的那张下载表搬过来，
+# 每个月初缓存键翻新一次，自动拿到当月版本。
+inputs:
+  optional:
+    description: 是否顺带拉可选库（GeoLite2-ASN / dbip / qqwry）
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: 月缓存键
+      id: month
+      shell: bash
+      run: echo "key=$(date -u +%Y%m)" >> "$GITHUB_OUTPUT"
+
+    - name: 恢复缓存
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: dbs
+        key: dbs-${{ steps.month.outputs.key }}-v1
+        restore-keys: dbs-
+
+    # 命中月度缓存 → 直接复用；否则 FORCE=1 全量重下（restore-keys 会把上个月的
+    # 文件先铺进来，不 FORCE 的话脚本会以为「已存在」而跳过，拿到的就是旧库）
+    - name: 下载依赖库
+      shell: bash
+      env:
+        FORCE: ${{ steps.cache.outputs.cache-hit != 'true' && '1' || '0' }}
+        OPTIONAL: ${{ inputs.optional }}
+      run: |
+        set -euo pipefail
+        args=()
+        [ "$OPTIONAL" = "true" ] && args+=(--optional)
+        bash scripts/fetch-dbs.sh dbs "${args[@]}"
+        echo "dbs 就绪：$(ls dbs | wc -l) 个文件，$(du -sh dbs | cut -f1)"

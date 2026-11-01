@@ -1,47 +1,242 @@
-name: Build
+name: LemonDB Monthly Build
 
+# 每月 1 号 UTC 18:00（北京 2 号 02:00）跑全量：WHOIS 底线 → 在线扫描 → 合并 → 世界库。
+# 扫描是小时级任务，日更没意义；APNIC dump 月级变化，坐标表和源库也是月级更新。
 on:
-  workflow_dispatch:
   schedule:
-    # 每日 01:30 UTC（北京 09:30）：APNIC dump 日更后自动重建
-    - cron: 30 1 * * *
+    - cron: '0 18 1 * *'
+  workflow_dispatch:
+    inputs:
+      skip_scan:
+        description: '跳过在线扫描，只重建底线（几分钟出结果，发布物标注为「仅底线」）'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
+# 同一时间只跑一份，避免两轮扫描同时打同一条出口 IP 被源限流
+concurrency:
+  group: monthly-build
+  cancel-in-progress: false
+
 jobs:
-  build:
+  # ── 1. WHOIS 底线 ────────────────────────────────────────────────
+  floor:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version-file: go.mod
+          cache: true
 
-      - name: Download APNIC dump
+      - name: 准备 dbs
+        uses: ./.github/actions/fetch-dbs
+
+      - name: 下载 APNIC dump
         run: |
-          mkdir -p data && cd data
           base=https://ftp.apnic.net/apnic/whois
           for f in inetnum inet6num aut-num route route6; do
-            curl -fsSL -o $f.gz "$base/apnic.db.$f.gz"
-            gunzip -kf $f.gz
+            curl -fsSL --retry 3 -o "$f.gz" "$base/apnic.db.$f.gz"
+            gunzip -kf "$f.gz"
           done
+          ls -lh inetnum inet6num aut-num route route6 | awk '{print $9, $5}'
 
-      - name: Build mmdb
+      - name: 构建底线与 ASN
         run: |
           go run . \
-            -inetnum data/inetnum -inet6num data/inet6num -autnum data/aut-num \
-            -route4 data/route -route6 data/route6 \
-            -out-location CN-LOCATION.mmdb -out-asn CN-ASN.mmdb
+            -inetnum inetnum -inet6num inet6num -autnum aut-num \
+            -route4 route -route6 route6 \
+            -out-location CN-LOCATION.mmdb -out-asn CN-ASN.mmdb \
+            -floor-out floor.jsonl -cover-out dbs
 
-      - name: Release
+      # china.txt / china6.txt 不再手工维护：同一份 APNIC dump 顺手生成（按 country: CN
+      # 收全量、合并重叠段后转 CIDR），扫描与验收都从这里的 artifact 取
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cover
+          path: |
+            dbs/china.txt
+            dbs/china6.txt
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: floor
+          path: |
+            floor.jsonl
+            CN-ASN.mmdb
+          retention-days: 3
+
+  # ── 2. 在线扫描（最慢的一段，4 小时量级）─────────────────────────
+  scan:
+    needs: floor
+    if: ${{ !inputs.skip_scan }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 准备 dbs
+        uses: ./.github/actions/fetch-dbs
+
+      - name: 公告段清单
+        uses: actions/download-artifact@v4
+        with:
+          name: cover
+          path: dbs
+
+      # TEO 控制台会话是可选源：没有 secret 就只靠 bilibili / 360 / 本地库
+      - name: 写入 TEO 凭据（可选）
+        env:
+          TEO_CONF: ${{ secrets.TEO_CONF }}
         run: |
-          TAG=$(date +%Y.%m.%d)
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" CN-LOCATION.mmdb CN-ASN.mmdb --clobber
+          if [ -n "${TEO_CONF:-}" ]; then
+            printf '%s' "$TEO_CONF" > teo-conf.json
+            echo "TEO 凭据已写入"
           else
-            gh release create "$TAG" CN-LOCATION.mmdb CN-ASN.mmdb --title "CN IP DB $TAG" --notes "WHOIS 底线库日更"
+            echo "无 TEO 凭据，跳过该源"
           fi
+
+      # runner 只有 4 核，12 进程只会把 360 打到限流，这里压到 6 进程
+      - name: 扫描
+        env:
+          V6_SHARDS: 3
+          V4_SHARDS: 3
+          MAX_MIN: 240
+        run: |
+          ( cd scanner && go build -o scan16 . )
+          ( cd scanner && ./run_v4_final.sh ) &
+          guard=$!
+          ( cd scanner && ./run_all.sh )
+          wait "$guard" 2>/dev/null || true
+          wc -l scanner/seg-v*.jsonl | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: segments
+          path: scanner/seg-v*.jsonl
+          retention-days: 3
+
+  # ── 3. 合并 + 世界库 + 发布 ──────────────────────────────────────
+  publish:
+    needs: [floor, scan]
+    if: ${{ always() && needs.floor.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 准备 dbs
+        uses: ./.github/actions/fetch-dbs
+        with:
+          optional: "true"   # 顺带 dbip-asn-lite（LEMON-ASN 底层补漏）
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: floor
+
+      - name: 公告段清单
+        uses: actions/download-artifact@v4
+        with:
+          name: cover
+          path: dbs
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: segments
+          path: scanner
+        continue-on-error: true
+
+      - name: 检查扫描段
+        id: segs
+        run: |
+          if ls scanner/seg-v*.jsonl >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "扫描段 $(cat scanner/seg-v*.jsonl | wc -l) 行"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::没有扫描段，本轮只出 WHOIS 底线库"
+          fi
+
+      - name: 行政区划坐标表
+        if: steps.segs.outputs.found == 'true'
+        run: |
+          for i in 1 2 3; do
+            git clone --depth 1 https://github.com/nomdn/division-coords divcoords && break
+            echo "clone 失败，第 $i 次重试"; sleep 5
+          done
+          test -f divcoords/division-coords.json
+
+      - name: merge
+        if: steps.segs.outputs.found == 'true'
+        run: |
+          ( cd merge && go build -o merge . )
+          ./merge/merge -floor floor.jsonl -segs "scanner/seg-v*.jsonl" \
+            -division dbs/full.txt -zx dbs/ipv6wry.db -geocn dbs/GeoCN.mmdb \
+            -out CN-LOCATION.mmdb
+
+      - name: world
+        if: steps.segs.outputs.found == 'true'
+        run: |
+          ( cd world && go build -o world . )
+          ./world/world -cn CN-LOCATION.mmdb -maxmind dbs/GeoLite2-City.mmdb \
+            -ip2loc dbs/IP2LOCATION-LITE-DB11.IPV6.BIN \
+            -coords divcoords/division-coords.json \
+            -out LEMON-LOCATION.mmdb
+
+      # 全球 ASN：GeoLite2-ASN 打底 + APNIC CN 精修（floor 的 CN-ASN.mmdb）
+      - name: asn
+        run: |
+          ( cd asn && go build -o asn . )
+          ./asn/asn -geolite dbs/GeoLite2-ASN.mmdb -apnic CN-ASN.mmdb \
+            -dbip dbs/dbip-asn-lite.mmdb -out LEMON-ASN.mmdb
+
+      - name: 覆盖率统计
+        run: go run ./stats -mmdb CN-LOCATION.mmdb | tee stats.txt
+
+      # 回查要打 360/bilibili，海外 runner 上不稳定，失败不阻塞发布
+      - name: 独立回查（best effort）
+        if: steps.segs.outputs.found == 'true'
+        continue-on-error: true
+        run: |
+          ( cd check && go build -o check . )
+          ./check/check -mmdb CN-LOCATION.mmdb -cover dbs/china.txt -n 500
+          ./check/check -mmdb CN-LOCATION.mmdb -segs "scanner/seg-v*.jsonl" -n 100 -w 4
+
+      - name: 发布
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=$(date -u +%Y.%m)
+          MODE="全量"
+          [ "${{ steps.segs.outputs.found }}" = "true" ] || MODE="仅 WHOIS 底线"
+          # 只发布全球版：LEMON-LOCATION 内含 CN 高精度层，CN-LOCATION / CN-ASN 是中间产物
+          FILES=""
+          [ -f LEMON-LOCATION.mmdb ] && FILES="$FILES LEMON-LOCATION.mmdb"
+          [ -f LEMON-ASN.mmdb ] && FILES="$FILES LEMON-ASN.mmdb"
+
+          NOTES=$(printf 'LemonDB 月度构建 %s（%s）\n\n```\n%s\n```\n' "$TAG" "$MODE" "$(cat stats.txt)")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $FILES --clobber
+          else
+            gh release create "$TAG" $FILES --title "LemonDB $TAG" --notes "$NOTES"
+          fi
+
+          # latest 常驻指向，方便下游用固定 URL 拉
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest $FILES --title "latest" --notes "指向最近一次成功构建（$TAG，$MODE）" --latest

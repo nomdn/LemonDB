@@ -26,7 +26,7 @@ import (
 	maxminddb "github.com/oschwald/maxminddb-golang/v2"
 	"resty.dev/v3"
 
-	"cnipdb/norm"
+	"lemondb/norm"
 )
 
 var debugBili = os.Getenv("SCAN_DEBUG") != ""
@@ -66,11 +66,13 @@ type scanner struct {
 	i360Client *resty.Client
 	lbsClient  *resty.Client
 	ip2r       *ip2regionSvc.Ip2Region
+	zxDB       *zxDB // ZX ipv6wry：v6 专用本地库，教育网/机构段能到区县
 	geocnDB    *maxminddb.Reader
 	maxmindDB  *maxminddb.Reader
 	dbipDB     *maxminddb.Reader
 	ip2locDB   *ip2location.DB
 	division   map[int]string
+	countyCity map[string]string // "县|省" → 市：只有县没有市时用来补市
 	lbsKey     string
 	lbsSK      string
 	lbsBudget  int
@@ -87,9 +89,17 @@ type scanner struct {
 	i360Every  time.Duration
 	probeCount int
 	lost       map[string]int  // 源 → 被 LBS 判错次数
+	no360      bool            // 关掉 360（被 403 封时用，避免每个请求挂到超时）
+	err360     int             // 360 连续失败计数（触发自动降速）
+	i360Base   time.Duration   // 360 的基准间隔（降速后要能回到这里）
+	ok360      int             // 360 连续成功计数（触发回升）
 	demoted    map[string]bool // 会话内降级的源
 	pfxBudget  int             // 单前缀探针预算
 	pfxUsed    int             // 当前前缀已用探针数
+	teo        *teoState       // 腾讯 EO 控制台通道（省级+市级，批量 100/次）
+	remoteCache sync.Map       // "ip|src" → answer：普查阶段批量预取的远程单点源结果
+	biliWorkers int            // bilibili 并发数（限速仍在 throttle 里，66ms/次）
+	census     bool            // v4 走 TEO 采样普查（关掉则逐块探针，可用 360 拿县级）
 }
 
 func (s *scanner) throttle(last *time.Time, every time.Duration) {
@@ -106,6 +116,16 @@ func (s *scanner) throttle(last *time.Time, every time.Duration) {
 // ---------- 各源 ----------
 
 func (s *scanner) bilibili(ip string) answer {
+	key := ip + "|bilibili"
+	if v, ok := s.remoteCache.Load(key); ok {
+		return v.(answer)
+	}
+	a := s.bilibiliFetch(ip)
+	s.remoteCache.Store(key, a)
+	return a
+}
+
+func (s *scanner) bilibiliFetch(ip string) answer {
 	s.throttle(&s.lastBili, s.biliEvery)
 	var w struct {
 		Code int `json:"code"`
@@ -126,14 +146,40 @@ func (s *scanner) bilibili(ip string) answer {
 }
 
 func (s *scanner) ip360(ip string) answer {
+	if s.no360 {
+		return answer{}
+	}
 	if net.ParseIP(ip).To4() == nil {
 		return answer{} // 360 仅 v4
+	}
+	key := ip + "|360"
+	if v, ok := s.remoteCache.Load(key); ok {
+		return v.(answer)
 	}
 	s.throttle(&s.last360, s.i360Every)
 	r, err := s.i360Client.R().SetQueryParam("ip", ip).Get("http://ip.360.cn/IPQuery/ipquery")
 	if err != nil || r.IsError() {
+		// 熔断降速：连续失败就把间隔拉长，避免被限流后一路空手而归还看不出来
+		s.netMu.Lock()
+		s.err360++
+		if s.err360%20 == 0 && s.i360Every < 300*time.Millisecond {
+			s.i360Every += 20 * time.Millisecond
+			fmt.Println("[360 降速] 连续失败", s.err360, "次，间隔调到", s.i360Every)
+		}
+		s.netMu.Unlock()
 		return answer{}
 	}
+	// 成功就慢慢把间隔降回基准：只降不升会让限流后永远停在最慢档
+	s.netMu.Lock()
+	s.err360 = 0
+	s.ok360++
+	if s.ok360%200 == 0 && s.i360Every > s.i360Base {
+		s.i360Every -= 5 * time.Millisecond
+		if s.i360Every < s.i360Base {
+			s.i360Every = s.i360Base
+		}
+	}
+	s.netMu.Unlock()
 	var w struct {
 		Errno int    `json:"errno"`
 		Data  string `json:"data"`
@@ -142,7 +188,37 @@ func (s *scanner) ip360(ip string) answer {
 		return answer{}
 	}
 	p, c, ct, isp := norm.Parse360Region(w.Data)
-	return answer{Src: "360", Province: p, City: c, County: ct, ISP: isp}
+	a := answer{Src: "360", Province: p, City: c, County: ct, ISP: isp}
+	s.remoteCache.Store(key, a)
+	return a
+}
+
+// remotePrefetch 普查前批量预取远程单点源：bilibili（v4/v6）+ 360（仅 v4）。
+// 「宁慢也要准」：远程源必须参与投票，不能因为慢就被跳过；
+// 限速仍在 bilibili 66ms/360 100ms 的 throttle 里，这里只加并发把延迟藏起来。
+func (s *scanner) remotePrefetch(ips []string, v4 bool) {
+	if len(ips) == 0 {
+		return
+	}
+	n := s.biliWorkers
+	if n < 1 {
+		n = 8
+	}
+	sem := make(chan struct{}, n)
+	var wg sync.WaitGroup
+	for _, ip := range ips {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			s.bilibili(ip)
+			if v4 {
+				s.ip360(ip)
+			}
+		}(ip)
+	}
+	wg.Wait()
 }
 
 func (s *scanner) ip2region(ip string) answer {
@@ -169,11 +245,21 @@ func (s *scanner) geocn(ip string) answer {
 		return answer{}
 	}
 	code := int(rec.DivisionCode)
-	province := s.division[(code/10000)*10000]
+	// 行政区字典里是「北京市 / 江苏省」全称，统一收敛到 norm 的短名，
+	// 否则与 ip2region/TEO/floor 的「北京 / 江苏」对不上，段会碎且误触发省不一致仲裁
+	province := norm.NormProvince(s.division[(code/10000)*10000])
 	city := s.division[(code/100)*100]
 	district := s.division[code]
 	if province == "" {
 		return answer{}
+	}
+	// division 里省级只有「省/直辖市」时，city 会回落成省名（湖南 → 湖南省）。
+	// 那不是市，必须清掉，否则会被当成市级精度写进库。
+	if city != "" && norm.NormProvince(city) == province {
+		city = ""
+	}
+	if district != "" && norm.NormProvince(district) == province {
+		district = ""
 	}
 	return answer{Src: "geocn", Province: province, City: city, County: district, ISP: norm.NormISP(rec.ISP)}
 }
@@ -283,14 +369,27 @@ func (s *scanner) probe(ip string, v4 bool) (answer, map[string]answer) {
 		go func() { defer wgR.Done(); setSrc(s.ip360(ip)) }()
 	}
 	wgR.Add(1)
-	go func() { defer wgR.Done(); setSrc(s.ip2region(ip)) }()
-	wgR.Add(1)
 	go func() { defer wgR.Done(); setSrc(s.geocn(ip)) }()
-	wgR.Wait()
-	// 主源优先级：v4 360(县) > bilibili > ip2region > geocn；v6 bilibili > geocn > ip2region
-	pick := []string{"bilibili", "ip2region", "geocn"}
 	if v4 {
-		pick = []string{"360", "bilibili", "ip2region", "geocn"}
+		wgR.Add(1)
+		go func() { defer wgR.Done(); setSrc(s.ip2region(ip)) }()
+	} else {
+		wgR.Add(1)
+		go func() { defer wgR.Done(); setSrc(s.zx(ip)) }()
+	}
+	wgR.Wait()
+	// TEO 走批量预取的缓存，不再发单点请求
+	if a := s.teoLookup(ip); a.Src != "" {
+		setSrc(a)
+	}
+	// 源优先级：
+	//   v4 360(可到县) > bilibili > teo > ip2region > geocn
+	//   v6 teo > zx > bilibili > geocn
+	// v6 不再使用 ip2region：实测它把宿迁判成盐城（2409:8a20 段），
+	// 且解析出「北京 41%」这类系统性偏差，属于会污染整库的错误源。
+	pick := []string{"teo", "zx", "bilibili", "geocn"}
+	if v4 {
+		pick = []string{"360", "bilibili", "teo", "ip2region", "geocn"}
 	}
 	for _, src := range pick {
 		if a, ok := all[src]; ok && !a.empty() {
@@ -319,6 +418,150 @@ func (s *scanner) probe(ip string, v4 bool) (answer, map[string]answer) {
 	rec := probeRec{primary: primary, all: all}
 	s.memo.Store(ip, rec)
 	return primary, all
+}
+
+// quickAnswer 普查用的零网络成本答案：TEO 批量缓存 + GeoCN + ip2region。
+// 远程单点源（bilibili/360）单次约 3 秒，普查阶段不调用。
+// GeoCN 能给到县，若与主源省市一致则补县（与 probe 的 mergeAnswer 同口径）。
+func (s *scanner) quickAnswer(ip string) answer {
+	a, _ := s.quickAll(ip, !strings.Contains(ip, ":"))
+	return a
+}
+
+// quickAll 普查采样点的「陪跑」查询：TEO 走批量预取（零额外网络），
+// 本地库直接读，全部结果都要留下来存档。主源由 pick 顺序决定，
+// 其余源是陪跑 —— 它们不参与定案，但提供票数和字段补全。
+func (s *scanner) quickAll(ip string, v4 bool) (answer, map[string]answer) {
+	all := map[string]answer{}
+	if a := s.teoLookup(ip); a.Src != "" {
+		all[a.Src] = a
+	}
+	if v4 {
+		if a := s.ip2region(ip); a.Src != "" {
+			all[a.Src] = a
+		}
+	} else {
+		// v6 用 ZX ipv6wry 取代 ip2region（后者 v6 实测把宿迁判成盐城）
+		if a := s.zx(ip); a.Src != "" {
+			all[a.Src] = a
+		}
+	}
+	if a := s.geocn(ip); a.Src != "" {
+		all[a.Src] = a
+	}
+	// 远程单点源（普查前已批量预取进 remoteCache）：bilibili 双栈，360 仅 v4
+	for _, src := range []string{"bilibili", "360"} {
+		if v, ok := s.remoteCache.Load(ip + "|" + src); ok {
+			if a := v.(answer); a.Src != "" {
+				all[a.Src] = a
+			}
+		}
+	}
+
+	// 主源优先级（宁慢也要准）：v4 360 能到县，放最前；v6 bilibili 判得最贴近实网
+	pick := []string{"bilibili", "teo", "zx", "geocn"}
+	if v4 {
+		pick = []string{"360", "bilibili", "teo", "ip2region", "geocn"}
+	}
+	var best answer
+	for _, k := range pick {
+		if a, ok := all[k]; ok && !a.empty() {
+			best = a
+			break
+		}
+	}
+	if best.Src == "" {
+		return answer{}, all
+	}
+	if best.County == "" {
+		if g := all["geocn"]; g.County != "" && g.Province == best.Province &&
+			(best.City == "" || g.City == best.City) {
+			best.County = g.County
+		}
+	}
+	// 只有县没有市（360 常见）：用行政区字典反推市
+	if best.City == "" && best.County != "" {
+		best.City = s.cityByCounty(best.Province, best.County)
+	}
+	return best, all
+}
+
+// cityByCounty 只有县/区、没有市时，用行政区字典把市反推出来。
+// 360 偶尔只给「泉山区」不给「徐州市」，这种正是要靠字典补的。
+func (s *scanner) cityByCounty(province, county string) string {
+	if province == "" || county == "" || s.countyCity == nil {
+		return ""
+	}
+	return s.countyCity[county+"|"+province]
+}
+
+// arbitrate 三源投票仲裁：主源之外还有源给出省级结论时，票多者定案。
+// 平票保留主源（宁缺毋滥，不为了「看起来确定了」而改判）。
+func (s *scanner) arbitrate(primary answer, sources map[string]answer) answer {
+	if primary.Province == "" {
+		return primary
+	}
+	votes := map[string]int{primary.Province: 1}
+	bysrc := map[string]answer{}
+	for k, a := range sources {
+		if k == primary.Src || a.Province == "" {
+			continue
+		}
+		votes[a.Province]++
+		bysrc[a.Province] = a
+	}
+	top, topN := primary.Province, votes[primary.Province]
+	for p, n := range votes {
+		if n > topN {
+			top, topN = p, n
+		}
+	}
+	if top == primary.Province {
+		return s.fillCity(primary, sources)
+	}
+	alt := bysrc[top]
+	alt.County = primary.County // 县名沿用（新省的下级不一定同名，交给下游决定是否丢弃）
+	return s.fillCity(alt, sources)
+}
+
+// 源优先级（票数打平时按这个顺序取，保证结果确定）
+var srcPrio = map[string]int{"360": 1, "bilibili": 2, "teo": 3, "zx": 4, "ip2region": 5, "geocn": 6}
+
+// fillCity 有省无市时，从「同省的陪跑源」里投票补市：票多者胜，平票按源优先级。
+// 不这么补的话，主源（比如 TEO 只给省）会把陪跑源已经答出的市白白丢掉。
+func (s *scanner) fillCity(primary answer, sources map[string]answer) answer {
+	if primary.City != "" || primary.Province == "" {
+		return primary
+	}
+	counts := map[string]int{}
+	cand := map[string]answer{}
+	for k, a := range sources {
+		if k == primary.Src || a.Province != primary.Province || a.City == "" {
+			continue
+		}
+		counts[a.City]++
+		if cur, ok := cand[a.City]; !ok || srcPrio[k] < srcPrio[cur.Src] {
+			cand[a.City] = a
+		}
+	}
+	bestCity, bestN := "", 0
+	for c, n := range counts {
+		if n > bestN || (n == bestN && srcPrio[cand[c].Src] < srcPrio[cand[bestCity].Src]) {
+			bestCity, bestN = c, n
+		}
+	}
+	if bestCity == "" {
+		return primary
+	}
+	a := cand[bestCity]
+	primary.City = a.City
+	if primary.County == "" {
+		primary.County = a.County
+	}
+	if primary.ISP == "" {
+		primary.ISP = a.ISP
+	}
+	return primary
 }
 
 // ---------- 区间二分 ----------
@@ -375,6 +618,16 @@ func (s *scanner) scanPrefix(cidr string, out *bufio.Writer, v4 bool, gran int) 
 	base := ipp.Addr()
 	L := ipp.Bits()
 	s.pfxUsed = 0
+	// TEO 缓存只服务于「当前前缀」：prefetch → 采样 → 段中点复核都在同一个前缀内完成。
+	// 不清的话全量跑下来每个进程要攒几十万条 IP → answer，内存一路涨。
+	if s.teo != nil {
+		s.teo.cache.Clear()
+	}
+	// 远程源缓存同样只服务当前前缀，否则全量跑下来内存会一直涨
+	s.remoteCache.Range(func(k, _ any) bool {
+		s.remoteCache.Delete(k)
+		return true
+	})
 
 	width := 16
 	var baseBytes []byte
@@ -397,6 +650,7 @@ func (s *scanner) scanPrefix(cidr string, out *bufio.Writer, v4 bool, gran int) 
 		province string
 	}
 	var parts []part
+	one := big.NewInt(1)
 	cursor := new(big.Int).Set(lo)
 	for _, fs := range floorWithin(lo, hi) {
 		fsLo, fsHi := fs.start, fs.end
@@ -406,15 +660,21 @@ func (s *scanner) scanPrefix(cidr string, out *bufio.Writer, v4 bool, gran int) 
 		if fsHi.Cmp(hi) > 0 {
 			fsHi = new(big.Int).Set(hi)
 		}
-		if fsLo.Cmp(cursor) > 0 { // 空洞
-			parts = append(parts, part{new(big.Int).Set(cursor), new(big.Int).Set(fsLo), ""})
+		if fsHi.Cmp(fsLo) < 0 || fsHi.Cmp(cursor) < 0 {
+			continue // 已覆盖过的段，跳过
 		}
-		if fsLo.Cmp(cursor) >= 0 {
-			parts = append(parts, part{new(big.Int).Set(fsLo), new(big.Int).Set(fsHi), fs.province})
-			cursor = new(big.Int).Set(fsHi)
+		if fsLo.Cmp(cursor) > 0 { // 空洞：cursor .. fsLo-1（闭区间，不能含 fsLo）
+			parts = append(parts, part{new(big.Int).Set(cursor), new(big.Int).Sub(fsLo, one), ""})
 		}
+		// 底线段与已覆盖区间取交集，避免 floor 段自身重叠时重复普查
+		sLo := new(big.Int).Set(cursor)
+		if fsLo.Cmp(cursor) > 0 {
+			sLo = new(big.Int).Set(fsLo)
+		}
+		parts = append(parts, part{sLo, new(big.Int).Set(fsHi), fs.province})
+		cursor = new(big.Int).Add(fsHi, one)
 	}
-	if cursor.Cmp(hi) < 0 {
+	if cursor.Cmp(hi) <= 0 {
 		parts = append(parts, part{new(big.Int).Set(cursor), new(big.Int).Set(hi), ""})
 	}
 
@@ -454,21 +714,55 @@ func (s *scanner) scanPrefix(cidr string, out *bufio.Writer, v4 bool, gran int) 
 			chunkSize = big.NewInt(1)
 		}
 
-		var prev answer
-		chunkLo := new(big.Int).Set(p.lo)
+		// ---- TEO 采样普查 ----
+		// 远程源单次 3 秒时逐块探针完全不划算（一个 /24 要 13 分钟），
+		// 而普查 400 个采样点只需 4 次 TEO 调用（约 2 秒），本地库零成本。
+		// 代价是丢了 360 的县级精度；需要县级时用 -census=false 走分块探针。
+		//
+		// 注意：TEO 会话失效（cookie 过期）时**仍然走普查**——此时 quickAnswer
+		// 自动退化成 geocn + ip2region 两个本地库，没有网络成本；若退回分块探针会
+		// 每块 3 秒，整轮直接崩掉。
+		if s.census {
+			s.teoCensus(p.lo, p.hi, p.province, cidr, v4, width, gran)
+			return
+		}
+
+		// ---- 块中点先全算出来，再一次性批量预取 TEO（100 IP/次）----
+		var mids, ends []*big.Int
 		for ci := int64(0); ; ci++ {
-			chunkHi := new(big.Int).Add(chunkLo, chunkSize)
-			chunkHi.Sub(chunkHi, big.NewInt(1))
-			if chunkHi.Cmp(p.hi) > 0 {
-				chunkHi.Set(p.hi)
+			clo := new(big.Int).Add(p.lo, new(big.Int).Mul(chunkSize, big.NewInt(ci)))
+			if clo.Cmp(p.hi) > 0 {
+				break
 			}
-			// 块中点探针
-			mid := new(big.Int).Add(chunkLo, chunkHi)
+			chi := new(big.Int).Add(clo, chunkSize)
+			chi.Sub(chi, big.NewInt(1))
+			if chi.Cmp(p.hi) > 0 {
+				chi.Set(p.hi)
+			}
+			mid := new(big.Int).Add(clo, chi)
 			mid.Div(mid, big.NewInt(2))
-			mb := mid.Bytes()
-			midIP := make(net.IP, width)
-			copy(midIP[width-len(mb):], mb)
-			addr, _ := netip.AddrFromSlice(midIP)
+			mids = append(mids, mid)
+			ends = append(ends, chi)
+			if chi.Cmp(p.hi) >= 0 {
+				break
+			}
+		}
+		if s.teo != nil {
+			ips := make([]string, len(mids))
+			for i, m := range mids {
+				ips[i] = bigIntToIP(m, width).String()
+			}
+			s.teoPrefetch(ips)
+		}
+
+		var prev answer
+		for ci := 0; ci < len(mids); ci++ {
+			chunkHi := ends[ci]
+			chunkLo := new(big.Int).Set(p.lo)
+			if ci > 0 {
+				chunkLo = new(big.Int).Add(ends[ci-1], big.NewInt(1))
+			}
+			addr, _ := netip.AddrFromSlice(bigIntToIP(mids[ci], width))
 
 			a, all := s.probe(addr.Unmap().String(), v4)
 			if a.empty() && p.province != "" {
@@ -483,18 +777,17 @@ func (s *scanner) scanPrefix(cidr string, out *bufio.Writer, v4 bool, gran int) 
 					s.pending[len(s.pending)-1].End = startAdd(chunkHi, width).String()
 				}
 			} else {
+				span := new(big.Int).Sub(chunkHi, chunkLo)
+				span.Add(span, big.NewInt(1))
+				span.Div(span, new(big.Int).Lsh(big.NewInt(1), uint(width*8-gran)))
 				s.collect(segment{
 					Start: startAdd(chunkLo, width).String(), End: startAdd(chunkHi, width).String(),
-					Prefix: cidr, Primary: a, Sources: all,
+					Prefix: cidr, Primary: a, Sources: all, Span: span,
 				})
 			}
 			prev = a
 
 			if chunkHi.Cmp(p.hi) >= 0 {
-				break
-			}
-			chunkLo.Add(chunkHi, big.NewInt(1))
-			if s.probeCount > 1<<30 {
 				break
 			}
 		}
@@ -513,49 +806,144 @@ func startAdd(n *big.Int, width int) net.IP {
 	return ip
 }
 
-// verifyAndFlush 段收集完毕：按跨度从大到小对段中点做 LBS 验证（预算制），
-// 之后全部落盘。未验证段保留主源答案原样。
+// segMidpoint 段中点（start/end 均为闭区间端点）
+func segMidpoint(seg *segment) (netip.Addr, bool) {
+	sa, e1 := netip.ParseAddr(seg.Start)
+	ea, e2 := netip.ParseAddr(seg.End)
+	if e1 != nil || e2 != nil {
+		return netip.Addr{}, false
+	}
+	width := 4
+	if !sa.Is4() {
+		width = 16
+	}
+	mid := new(big.Int).Add(addrToBig(sa.Unmap()), addrToBig(ea.Unmap()))
+	mid.Div(mid, big.NewInt(2))
+	addr, ok := netip.AddrFromSlice(bigIntToIP(mid, width))
+	if !ok {
+		return netip.Addr{}, false
+	}
+	return addr.Unmap(), true
+}
+
+// verifyAndFlush 段收集完毕：先批量用 TEO 验段中点（免费、100 IP/次），
+// TEO 无结果的段再用 LBS 兜底（预算制）。之后全部落盘。
+//
+// 仲裁规则（宁缺毋滥）：
+//   - 省不一致 → 以 TEO 定案（TEO 省级实测准）
+//   - 市不一致 → 只有原本没市（floor 兜底）时才采纳 TEO，其余仅记录不覆盖
 func (s *scanner) verifyAndFlush(out *bufio.Writer) {
 	if len(s.pending) == 0 {
 		return
 	}
+	// 不同 floor part / 空洞会切出首尾相接、答案完全一致的段，先合并再验证。
+	// pending 在此前是按地址顺序产出的，所以线性合并即可。
+	merged := make([]segment, 0, len(s.pending))
+	for _, seg := range s.pending {
+		if n := len(merged); n > 0 {
+			last := &merged[n-1]
+			if last.Prefix == seg.Prefix && last.Primary.sig() == seg.Primary.sig() && adjacentSeg(*last, seg) {
+				last.End = seg.End
+				if last.Span != nil && seg.Span != nil {
+					last.Span = new(big.Int).Add(last.Span, seg.Span)
+				}
+				continue
+			}
+		}
+		merged = append(merged, seg)
+	}
+	s.pending = merged
+
 	sort.Slice(s.pending, func(i, j int) bool {
+		if s.pending[i].Span == nil {
+			return false
+		}
+		if s.pending[j].Span == nil {
+			return true
+		}
 		return s.pending[i].Span.Cmp(s.pending[j].Span) > 0
 	})
+
+	// 候选段中点一次性批量预取 TEO
+	var mids []string
+	for i := range s.pending {
+		seg := &s.pending[i]
+		if seg.Span != nil && seg.Span.Cmp(big.NewInt(4)) > 0 && !seg.Primary.empty() {
+			if a, ok := segMidpoint(seg); ok {
+				mids = append(mids, a.String())
+			}
+		}
+	}
+	if s.teo != nil && len(mids) > 0 {
+		s.teoPrefetch(mids)
+	}
+
 	s.outMu.Lock()
 	defer s.outMu.Unlock()
 	for i := range s.pending {
 		seg := &s.pending[i]
-		if s.lbsBudget > 0 && seg.Span != nil && seg.Span.Cmp(big.NewInt(4)) > 0 && !seg.Primary.empty() {
-			sa, e1 := netip.ParseAddr(seg.Start)
-			ea, e2 := netip.ParseAddr(seg.End)
-			if e1 == nil && e2 == nil {
-				var sab, eab []byte
-				if sa.Is4() {
-					b4 := sa.As4()
-					sab = []byte(b4[:])
-				} else {
-					b16 := sa.As16()
-					sab = []byte(b16[:])
+		if seg.Span != nil && seg.Span.Cmp(big.NewInt(4)) > 0 && !seg.Primary.empty() {
+			if addr, ok := segMidpoint(seg); ok {
+				ip := addr.String()
+				verified := false
+				// 段太大时中点结论不足以代表整段（v6 粗格一段就是 2^98 个地址），
+				// 只记录不覆盖，避免一个采样点改写一整片。
+				tooBig := seg.Span == nil || seg.Span.Cmp(big.NewInt(65536)) > 0
+				if tv := s.teoLookup(ip); tv.Src != "" {
+					seg.Sources["teo_verify"] = tv
+					if !tooBig {
+						switch {
+						case seg.Primary.Src != "teo" && tv.Province != "" && tv.Province != seg.Primary.Province:
+							tv.County = seg.Primary.County
+							seg.Primary = tv // 主源不是 TEO：TEO 作为独立仲裁者定案
+						case seg.Primary.Src != "teo" && tv.City != "" && seg.Primary.City == "":
+							tv.County = seg.Primary.County
+							seg.Primary = tv // 原本没市：补市
+						case seg.Primary.Src == "teo" && tv.Province != "" && tv.Province != seg.Primary.Province:
+							// 主源就是 TEO，自己复核自己不算仲裁，只标记冲突留给下游
+							seg.Sources["teo_conflict"] = tv
+						}
+					}
+					verified = seg.Primary.Src == "teo" || tooBig || tv.Province == seg.Primary.Province
 				}
-				if ea.Is4() {
-					b4 := ea.As4()
-					eab = []byte(b4[:])
-				} else {
-					b16 := ea.As16()
-					eab = []byte(b16[:])
+				// —— 市级/县级补全：段中点专门再问一次「市级精度」的源 ——
+				// 采样点格宽 /16~/>/36 时中点落点可能正好在 TEO 的空档，导致有省无市；
+				// bilibili 只要 80ms 且是市级精度，值得为每个缺市段单独补一针。
+				if !tooBig && seg.Primary.Province != "" && seg.Primary.City == "" {
+					for _, cand := range []answer{s.bilibili(ip), s.ip360(ip)} {
+						if cand.Src == "" || cand.City == "" || cand.Province != seg.Primary.Province {
+							continue
+						}
+						seg.Sources[cand.Src+"_city"] = cand
+						seg.Primary.City = cand.City
+						seg.Primary.County = cand.County // 市县同源，保证不自相矛盾
+						if seg.Primary.ISP == "" {
+							seg.Primary.ISP = cand.ISP
+						}
+						break
+					}
 				}
-				mid := new(big.Int).Add(new(big.Int).SetBytes(sab), new(big.Int).SetBytes(eab))
-				mid.Div(mid, big.NewInt(2))
-				mb := mid.Bytes()
-				midIP := make(net.IP, 16)
-				copy(midIP[16-len(mb):], mb)
-				addr, _ := netip.AddrFromSlice(midIP)
-				if lb := s.lbs(addr.Unmap().String()); lb.Src != "" {
-					seg.Sources["lbs"] = lb
-					if lb.City != "" && seg.Primary.City != "" && lb.City != seg.Primary.City {
-						lb.County = seg.Primary.County
-						seg.Primary = lb // 验证不符：LBS 定案
+				// 有市缺县：360 是唯一能到县的源（仅 v4），同省同市才采信
+				if !tooBig && seg.Primary.City != "" && seg.Primary.County == "" {
+					if c := s.ip360(ip); c.County != "" && c.Province == seg.Primary.Province &&
+						(c.City == "" || c.City == seg.Primary.City) {
+						seg.Sources["360_county"] = c
+						seg.Primary.County = c.County
+					}
+				}
+				// 兜底：任何情况下「有县无市」都用字典补市，避免库里出现「江苏 泉山区」这种残记录
+				if seg.Primary.City == "" && seg.Primary.County != "" {
+					if ct := s.cityByCounty(seg.Primary.Province, seg.Primary.County); ct != "" {
+						seg.Primary.City = ct
+					}
+				}
+				if !verified && s.lbsBudget > 0 {
+					if lb := s.lbs(ip); lb.Src != "" {
+						seg.Sources["lbs"] = lb
+						if lb.City != "" && seg.Primary.City != "" && lb.City != seg.Primary.City {
+							lb.County = seg.Primary.County
+							seg.Primary = lb // 验证不符：LBS 定案
+						}
 					}
 				}
 			}
@@ -568,14 +956,19 @@ func (s *scanner) verifyAndFlush(out *bufio.Writer) {
 }
 
 // ---------- 底线脚手架 ----------
+//
+// floor.jsonl 是「粗段套细段」的嵌套结构：23 万条里 21.8 万条的 end 不是单调递增，
+// 直接在 end 上二分必然失效（会从错误的索引开扫、漏掉整段）。所以先做一次扫描线
+// 归并，把嵌套/重叠压成互不重叠的片段，每个坐标点取「最内层」（start 最大、同 start
+// 取 end 最小）的省名；之后查询就是在 start 上的普通二分。
 
-type floorSeg struct {
+type floorPiece struct {
 	start, end *big.Int
 	province   string
-	iso, en    string
 }
 
-var floorSegs []floorSeg
+var floorPieces []floorPiece
+var floorCount int
 
 func loadFloor(path string) {
 	f, err := os.Open(path)
@@ -584,6 +977,15 @@ func loadFloor(path string) {
 		return
 	}
 	defer f.Close()
+
+	floorPieces = floorPieces[:0]
+	floorCount = 0
+
+	type rawSeg struct {
+		s, e     *big.Int
+		province string
+	}
+	var raw []rawSeg
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<20)
 	for sc.Scan() {
@@ -598,42 +1000,105 @@ func loadFloor(path string) {
 		if e1 != nil || e2 != nil {
 			continue
 		}
-		var sb, eb []byte
-		if sa.Is4() {
-			b := sa.As4()
-			sb = []byte(b[:])
-		} else {
-			b := sa.As16()
-			sb = []byte(b[:])
+		sv, ev := addrToBig(sa.Unmap()), addrToBig(ea.Unmap())
+		if sv.Cmp(ev) > 0 {
+			continue
 		}
-		if ea.Is4() {
-			b := ea.As4()
-			eb = []byte(b[:])
-		} else {
-			b := ea.As16()
-			eb = []byte(b[:])
-		}
-		floorSegs = append(floorSegs, floorSeg{
-			start: new(big.Int).SetBytes(sb), end: new(big.Int).SetBytes(eb),
-			province: d.Province, iso: d.Iso, en: d.En,
-		})
+		raw = append(raw, rawSeg{sv, ev, norm.NormProvince(d.Province)})
 	}
-	sort.Slice(floorSegs, func(i, j int) bool { return floorSegs[i].start.Cmp(floorSegs[j].start) < 0 })
-	fmt.Println("floor 脚手架:", len(floorSegs))
+	floorCount = len(raw)
+	if len(raw) == 0 {
+		return
+	}
+
+	// start 升序；同 start 时 end 降序（大段在前，便于扫描线判定最内层）
+	sort.Slice(raw, func(i, j int) bool {
+		if c := raw[i].s.Cmp(raw[j].s); c != 0 {
+			return c < 0
+		}
+		return raw[i].e.Cmp(raw[j].e) > 0
+	})
+
+	// 事件点：start 进入、end+1 退出
+	type ev struct {
+		p   *big.Int
+		add bool
+		idx int
+	}
+	evs := make([]ev, 0, len(raw)*2)
+	one := big.NewInt(1)
+	for i := range raw {
+		evs = append(evs, ev{raw[i].s, true, i})
+		evs = append(evs, ev{new(big.Int).Add(raw[i].e, one), false, i})
+	}
+	sort.Slice(evs, func(i, j int) bool {
+		if c := evs[i].p.Cmp(evs[j].p); c != 0 {
+			return c < 0
+		}
+		return !evs[i].add && evs[j].add // 同一坐标先退出再进入
+	})
+
+	active := map[int]bool{}
+	innermost := func() int {
+		best := -1
+		for i := range active {
+			if best < 0 {
+				best = i
+				continue
+			}
+			c := raw[i].s.Cmp(raw[best].s)
+			if c == 0 {
+				c = raw[best].e.Cmp(raw[i].e) // end 更小的更内层
+			}
+			if c > 0 || (c == 0 && i < best) { // 完全相同则按索引，保证结果确定
+				best = i
+			}
+		}
+		return best
+	}
+
+	for k := 0; k < len(evs); {
+		p := evs[k].p
+		for ; k < len(evs) && evs[k].p.Cmp(p) == 0; k++ {
+			if evs[k].add {
+				active[evs[k].idx] = true
+			} else {
+				delete(active, evs[k].idx)
+			}
+		}
+		if k >= len(evs) || len(active) == 0 {
+			continue
+		}
+		bi := innermost()
+		if bi < 0 || raw[bi].province == "" {
+			continue
+		}
+		end := new(big.Int).Sub(evs[k].p, one) // 片段 [p, 下一个事件点-1]
+		// 相邻同省片段直接合并，压低片段数
+		if n := len(floorPieces); n > 0 {
+			last := &floorPieces[n-1]
+			if last.province == raw[bi].province &&
+				new(big.Int).Add(last.end, one).Cmp(p) == 0 {
+				last.end = end
+				continue
+			}
+		}
+		floorPieces = append(floorPieces, floorPiece{new(big.Int).Set(p), end, raw[bi].province})
+	}
+	fmt.Printf("floor 脚手架: %d 段 → %d 互斥片段\n", floorCount, len(floorPieces))
 }
 
-// floorWithin 返回与 [lo,hi] 相交的底线段（lo/hi 为 16 字节大数）
-func floorWithin(lo, hi *big.Int) []floorSeg {
-	// 二分找第一个 end >= lo 的段
-	i := sort.Search(len(floorSegs), func(i int) bool {
-		return floorSegs[i].end.Cmp(lo) >= 0
+// floorWithin 返回与 [lo,hi] 相交的片段（片段互不重叠且按 start 升序，end 单调）
+func floorWithin(lo, hi *big.Int) []floorPiece {
+	i := sort.Search(len(floorPieces), func(i int) bool {
+		return floorPieces[i].end.Cmp(lo) >= 0
 	})
-	var out []floorSeg
-	for ; i < len(floorSegs); i++ {
-		if floorSegs[i].start.Cmp(hi) > 0 {
+	var out []floorPiece
+	for ; i < len(floorPieces); i++ {
+		if floorPieces[i].start.Cmp(hi) > 0 {
 			break
 		}
-		out = append(out, floorSegs[i])
+		out = append(out, floorPieces[i])
 	}
 	return out
 }
@@ -660,7 +1125,13 @@ func loadState(p string) *state {
 
 func (st *state) save(p string) {
 	b, _ := json.MarshalIndent(st, "", " ")
-	os.WriteFile(p, b, 0644)
+	// 先写临时文件再改名：扫描器被 kill 时若直接覆盖，可能留下半截 JSON，
+	// loadState 解析失败会静默当空状态 → 整轮重扫、产出重复段。
+	tmp := p + ".tmp"
+	if os.WriteFile(tmp, b, 0644) != nil {
+		return
+	}
+	os.Rename(tmp, p)
 }
 
 func loadDivision(path string) map[int]string {
@@ -712,7 +1183,25 @@ func main() {
 	only := flag.String("only", "", "v4 / v6，空=先 v6 后 v4")
 	maxMin := flag.Int("max-minutes", 300, "最长运行分钟数")
 	pfxBudget := flag.Int("prefix-budget", 2500, "单前缀探针预算（超限粗普查兜底）")
+	teoConfPath := flag.String("teo-conf", "../teo-conf.json", "TEO 控制台会话凭据（不填=不用该源）")
+	doneExtra := flag.String("done-extra", "", "额外读取这些状态文件的已完成前缀（逗号分隔）")
+	biliWorkers := flag.Int("bili-workers", 10, "远程源并发数；12 个进程共用一条出口 IP，调大反而被限流")
+	censusOn := flag.Bool("census", true, "v4 用 TEO 采样普查（关掉走逐块探针，能拿 360 县级）")
+	gap360 := flag.Duration("360-gap", 40*time.Millisecond, "360 查询基准间隔（被限流后调大）")
+	no360 := flag.Bool("no-360", false, "跳过 360（被 403 封时避免请求挂到超时）")
+	shard := flag.String("shard", "", "分片 i/n（按列表行号取模，多进程并行用）")
 	flag.Parse()
+
+	// 分片：多进程各跑 i/n，前缀互不重叠，产出直接拼接即可
+	shardIdx, shardN := 0, 1
+	if *shard != "" {
+		var i, n int
+		if _, err := fmt.Sscanf(*shard, "%d/%d", &i, &n); err == nil && n > 0 && i >= 0 && i < n {
+			shardIdx, shardN = i, n
+		} else {
+			fmt.Println("分片参数无效，忽略:", *shard)
+		}
+	}
 
 	if *v4list == "" {
 		*v4list = *dbs + "/china.txt"
@@ -726,8 +1215,12 @@ func main() {
 		biliClient: resty.New().SetTimeout(10*time.Second).SetHeader("User-Agent", "Mozilla/5.0"),
 		i360Client: resty.New().SetTimeout(10*time.Second).SetHeader("User-Agent", "Mozilla/5.0").SetHeader("Referer", "http://ip.360.cn/"),
 		lbsClient:  resty.New().SetTimeout(10 * time.Second),
-		biliEvery:  66 * time.Millisecond, i360Every: 100 * time.Millisecond,
+		biliEvery:  30 * time.Millisecond, i360Every: *gap360,
+		i360Base: *gap360,
+		no360: *no360,
+		biliWorkers: *biliWorkers,
 		pfxBudget: *pfxBudget,
+		census:    *censusOn,
 	}
 	var err error
 	s.ip2r, err = ip2regionSvc.NewIp2Region(mustConfig(*dbs+"/ip2region_v4.xdb", false), mustConfig(*dbs+"/ip2region_v6.xdb", true))
@@ -746,8 +1239,30 @@ func main() {
 	if s.ip2locDB, err = ip2location.OpenDB(*dbs + "/IP2LOCATION-LITE-DB11.IPV6.BIN"); err != nil {
 		s.ip2locDB = nil
 	}
+	if z, err := openZX(*dbs + "/ipv6wry.db"); err != nil {
+		fmt.Println("ipv6wry:", err)
+	} else {
+		s.zxDB = z
+		fmt.Printf("ZX ipv6wry 就绪: %d 条记录\n", z.count)
+	}
 
 	st := loadState(*stateF)
+	// 追加读取其他分片的状态：v6 跑完后要把 6 个进程挪去 v4，
+	// 不共享 done 集合就会互相重扫同一批前缀。
+	if *doneExtra != "" {
+		for _, extra := range strings.Split(*doneExtra, ",") {
+			extra = strings.TrimSpace(extra)
+			if extra == "" {
+				continue
+			}
+			var o state
+			if b, err := os.ReadFile(extra); err == nil && json.Unmarshal(b, &o) == nil {
+				for k := range o.Done {
+					st.Done[k] = true
+				}
+			}
+		}
+	}
 	s.st = st
 	s.lbsBudget = *lbsBudget - st.LBSUsed
 	if s.lbsBudget < 0 {
@@ -756,9 +1271,25 @@ func main() {
 
 	loadFloor("../floor.jsonl")
 
+	s.teoInit(*teoConfPath)
+
 	s.division = loadDivision(*dbs + "/full.txt")
-	fmt.Printf("本地库就绪: ip2region=%v geocn=%v maxmind=%v dbip=%v ip2loc=%v division=%d | floor=%d\n",
-		s.ip2r != nil, s.geocnDB != nil, s.maxmindDB != nil, s.dbipDB != nil, s.ip2locDB != nil, len(s.division), len(floorSegs))
+	// 县 → 市 反查（带省名做键，避免「朝阳区」这种跨省同名）
+	s.countyCity = map[string]string{}
+	for code, name := range s.division {
+		pc, cc := code/10000*10000, code/100*100
+		if code == pc || code == cc {
+			continue // 省/市本级跳过，只收区县
+		}
+		cityName, provName := s.division[cc], s.division[pc]
+		prov := norm.NormProvince(provName)
+		if cityName == "" || prov == "" || cityName == provName {
+			continue
+		}
+		s.countyCity[name+"|"+prov] = cityName
+	}
+	fmt.Printf("本地库就绪: ip2region=%v geocn=%v maxmind=%v dbip=%v ip2loc=%v division=%d | floor=%d段/%d片段\n",
+		s.ip2r != nil, s.geocnDB != nil, s.maxmindDB != nil, s.dbipDB != nil, s.ip2locDB != nil, len(s.division), floorCount, len(floorPieces))
 
 	granFor := func(cidr string) int {
 		if strings.Contains(cidr, ":") {
@@ -784,9 +1315,18 @@ func main() {
 		defer pf.Close()
 		sc := bufio.NewScanner(pf)
 		n := 0
+		row := 0
 		for sc.Scan() {
 			cidr := strings.TrimSpace(sc.Text())
+			// 分片必须按「文件行号」算，不能按「未完成行号」算：
+			// 断点续跑时已完成的行会被跳过，用过滤后的行号会让分片整体错位，
+			// 导致各分片互相越界重扫（实测 v6 因此被扫了 4480 个，超过列表总数）。
+			idx := row
+			row++
 			if cidr == "" || st.Done[cidr] {
+				continue
+			}
+			if shardN > 1 && idx%shardN != shardIdx {
 				continue
 			}
 			n++
@@ -835,4 +1375,14 @@ func main() {
 	}
 	st.save(*stateF)
 	fmt.Println("扫描结束: 探针", s.probeCount, "LBS", st.LBSUsed)
+}
+
+// adjacentSeg 判断两段是否首尾相接（a.end + 1 == b.start）
+func adjacentSeg(a, b segment) bool {
+	ea, e1 := netip.ParseAddr(a.End)
+	sb, e2 := netip.ParseAddr(b.Start)
+	if e1 != nil || e2 != nil || ea.Is4() != sb.Is4() {
+		return false
+	}
+	return new(big.Int).Add(addrToBig(ea.Unmap()), big.NewInt(1)).Cmp(addrToBig(sb.Unmap())) == 0
 }

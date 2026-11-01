@@ -1,6 +1,6 @@
 package main
 
-import . "cnipdb/norm"
+import . "lemondb/norm"
 
 import "strings"
 

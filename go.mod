@@ -1,4 +1,4 @@
-module cnipdb
+module lemondb
 
 go 1.26.0
 

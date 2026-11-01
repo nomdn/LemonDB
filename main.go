@@ -1,4 +1,4 @@
-// cnipdb —— 中国 IP 归属地离线库构建器
+// LemonDB —— 中国 IP 归属地离线库构建器
 //
 // 阶段一（WHOIS 低精度底线）：
 //
@@ -9,7 +9,7 @@
 // 多源探针，按 县 > 市 > 省 覆盖 WHOIS 底线；ZX(2021)/GeoCN 作 v6 种子。
 package main
 
-import . "cnipdb/norm"
+import . "lemondb/norm"
 
 import (
 	"bufio"
@@ -19,6 +19,8 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/maxmind/mmdbwriter"
@@ -171,6 +173,141 @@ func parseUint(s string) uint32 {
 	return n
 }
 
+// writeCoverLists 从 APNIC dump 生成扫描器的公告段清单：
+//
+//	china.txt   → v4 CIDR，一行一个
+//	china6.txt  → v6 CIDR
+//
+// 只按 country: CN 过滤，跟省名/运营商是否识别得出来无关——清单用来「划范围」，
+// 范围小了才是灾难，识别不出来只是交给扫描阶段补。
+//
+// 必须先去重合并：APNIC 的 inetnum 有父子重叠记录（/16 分配里再登记 /24 指派），
+// 两条都标 CN，直接逐条输出会把同一段算两遍——实测 411.1M 地址，而中国实际
+// 公告空间约 344.1M，虚增 20% 的扫描量。合并重叠 + 相邻区间后再转 CIDR。
+func writeCoverLists(dir, inetnumPath, inet6numPath string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	targets := []struct {
+		file string // 输出文件名
+		src  string // APNIC dump
+		key  string // 对象键
+		v4   bool   // 是否取 v4 地址族
+	}{
+		{"china.txt", inetnumPath, "inetnum:", true},
+		{"china6.txt", inet6numPath, "inet6num:", false},
+	}
+
+	for _, t := range targets {
+		ivs := collectCNIntervals(t.src, t.key, t.v4)
+		ivs = mergeIntervals(ivs)
+
+		f, err := os.Create(filepath.Join(dir, t.file))
+		if err != nil {
+			return err
+		}
+		w := bufio.NewWriter(f)
+		n, addrs := 0, new(big.Int)
+		for _, iv := range ivs {
+			lo, hi := intToIP(iv.lo), intToIP(iv.hi)
+			addrs.Add(addrs, new(big.Int).Sub(iv.hi, iv.lo))
+			addrs.Add(addrs, big.NewInt(1))
+			for _, ipnet := range rangeToCIDRs(lo.String() + " - " + hi.String()) {
+				fmt.Fprintln(w, ipnet.String())
+				n++
+			}
+		}
+		if err := w.Flush(); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		// 地址数：v4 顺便报个 M，v6 那个量级报 M 没意义，直接给原始计数
+		total := addrs.String()
+		if t.v4 {
+			mb := new(big.Float).Quo(new(big.Float).SetInt(addrs), big.NewFloat(1<<20))
+			if f, _ := mb.Float64(); f > 0 {
+				total = fmt.Sprintf("%s（%.1fM）", total, f)
+			}
+		}
+		fmt.Printf("%s: %d 个 CN 公告段，%d 个 CIDR，%s 地址\n",
+			filepath.Join(dir, t.file), len(ivs), n, total)
+	}
+	return nil
+}
+
+// interval 闭区间 [lo, hi]，用大整数存以便 v6 也能比
+type interval struct {
+	lo, hi *big.Int
+}
+
+// collectCNIntervals 把 dump 里 country: CN 的对象展开成闭区间
+func collectCNIntervals(path, keyPrefix string, wantV4 bool) []interval {
+	var out []interval
+	err := parseRPSL(path, keyPrefix, func(o rpslObject) {
+		if o.country != "CN" {
+			return
+		}
+		for _, ipnet := range rangeToCIDRs(o.key) {
+			// 地址族归位：inet6num 里偶尔出现 ::ffff: 写法的 v4 段
+			if (ipnet.IP.To4() != nil) != wantV4 {
+				continue
+			}
+			ip := net.IP(ipnet.IP)
+			if v4 := ip.To4(); v4 != nil {
+				ip = v4
+			}
+			lo := new(big.Int).SetBytes(ip)
+			ones, bits := ipnet.Mask.Size()
+			size := new(big.Int).Lsh(big.NewInt(1), uint(bits-ones))
+			hi := new(big.Int).Sub(new(big.Int).Add(lo, size), big.NewInt(1))
+			out = append(out, interval{lo, hi})
+		}
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", path, err)
+	}
+	return out
+}
+
+// mergeIntervals 排序后合并重叠与首尾相接的区间
+func mergeIntervals(in []interval) []interval {
+	sort.Slice(in, func(i, j int) bool { return in[i].lo.Cmp(in[j].lo) < 0 })
+	out := make([]interval, 0, len(in))
+	one := big.NewInt(1)
+	for _, cur := range in {
+		if len(out) == 0 {
+			out = append(out, cur)
+			continue
+		}
+		last := &out[len(out)-1]
+		// cur.lo <= last.hi+1 即相邻或重叠
+		if cur.lo.Cmp(new(big.Int).Add(last.hi, one)) <= 0 {
+			if cur.hi.Cmp(last.hi) > 0 {
+				last.hi = cur.hi
+			}
+			continue
+		}
+		out = append(out, cur)
+	}
+	return out
+}
+
+// intToIP 大整数还原成 IP（4 字节为 v4，否则 16 字节）
+func intToIP(n *big.Int) net.IP {
+	b := n.Bytes()
+	size := 16
+	if len(b) <= 4 {
+		size = 4
+	}
+	ip := make(net.IP, size)
+	copy(ip[size-len(b):], b)
+	return ip
+}
+
 func main() {
 	inetnum := flag.String("inetnum", "inetnum", "APNIC apnic.db.inetnum（解压后）")
 	inet6num := flag.String("inet6num", "inet6num", "APNIC apnic.db.inet6num（解压后）")
@@ -180,7 +317,19 @@ func main() {
 	outLoc := flag.String("out-location", "CN-LOCATION.mmdb", "")
 	outASN := flag.String("out-asn", "CN-ASN.mmdb", "")
 	floorOut := flag.String("floor-out", "", "底线段导出 JSONL（扫描器脚手架，可选）")
+	coverOut := flag.String("cover-out", "", "公告段清单输出目录（china.txt / china6.txt），可选")
 	flag.Parse()
+
+	// ---------- 公告段清单 ----------
+	// 扫描器按 china.txt / china6.txt 列出的 CN 公告段切格，原来这两个文件是手工
+	// 维护的静态文件，月更时容易和 APNIC 脱节。既然 dump 已经在手上，直接生成：
+	// 凡是 country: CN 的对象全收，**不要求**省市名识别成功（清单的目的只是划范围，
+	// 识别不出来的段后面由扫描补，漏掉的段才是真损失）。
+	if *coverOut != "" {
+		if err := writeCoverLists(*coverOut, *inetnum, *inet6num); err != nil {
+			panic(err)
+		}
+	}
 
 	var floorW *bufio.Writer
 	if *floorOut != "" {

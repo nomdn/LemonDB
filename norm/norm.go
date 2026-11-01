@@ -132,7 +132,12 @@ func Parse360Region(data string) (province, city, county, isp string) {
 	if strings.HasSuffix(rest, "县") || strings.HasSuffix(rest, "区") || strings.HasSuffix(rest, "旗") {
 		county = rest
 	} else if rest != "" && city == "" {
-		city = rest
+		// 只有形如「XX市/盟/州/地区」才承认是市；360 会返回 "*" 这种占位符，
+		// 直接当市写进库就成了 "江苏 *"。
+		if strings.HasSuffix(rest, "市") || strings.HasSuffix(rest, "盟") ||
+			strings.HasSuffix(rest, "州") || strings.HasSuffix(rest, "地区") {
+			city = rest
+		}
 	}
 	if province == "" {
 		province = NormProvince(region)
@@ -147,21 +152,36 @@ func Parse360Region(data string) (province, city, county, isp string) {
 	return province, city, county, isp
 }
 
-// ParseIP2Region 解析 "国家|区域|省|市|ISP"
+// ParseIP2Region 解析 ip2region 结果串，v4/v6 布局不同：
+//
+//	v4: "国家|区域|省|市|运营商"     例：中国|0|江苏省|宿迁市|移动
+//	v6: "国家|省|市|运营商|ISO"      例：中国|江苏省|盐城市|移动|CN
+//
+// 早期按 v4 布局硬编码，导致 v6 里「运营商」被当成市（"移动市"）、ISO 被当成运营商、
+// 省名还常取到城市名而返回空 —— v6 段大面积误判成北京就是这条引起的。
 func ParseIP2Region(s string) (province, city, isp string) {
 	p := strings.Split(s, "|")
-	if len(p) >= 5 {
-		isp = NormISP(p[4])
+	if len(p) < 4 {
+		return "", "", ""
 	}
-	if len(p) >= 4 {
-		province = NormProvince(p[2])
-		// 城市守卫：全国性网络（教育网/骨干网）的"城市"是垃圾值，不落市字段
-		if province != "" && p[3] != "" && p[3] != "0" &&
-			!strings.Contains(p[3], "教育") && !strings.Contains(p[3], "中国") && !strings.Contains(p[3], "骨干") {
-			city = p[3]
-			if !strings.HasSuffix(city, "市") {
-				city += "市"
-			}
+	provIdx, cityIdx, ispIdx := 2, 3, 4
+	// v6 布局：最后一段是 2 位国家级 ISO 码
+	if len(p) >= 5 && len(p[4]) == 2 && strings.EqualFold(p[4], "CN") {
+		provIdx, cityIdx, ispIdx = 1, 2, 3
+	}
+	if ispIdx < len(p) {
+		isp = NormISP(p[ispIdx])
+	}
+	province = NormProvince(p[provIdx])
+	// 城市守卫：全国性网络（教育网/骨干网）的"城市"是垃圾值，不落市字段
+	if province != "" && cityIdx < len(p) && p[cityIdx] != "" && p[cityIdx] != "0" &&
+		!strings.Contains(p[cityIdx], "教育") && !strings.Contains(p[cityIdx], "中国") &&
+		!strings.Contains(p[cityIdx], "骨干") && !strings.Contains(p[cityIdx], "移动") &&
+		!strings.Contains(p[cityIdx], "联通") && !strings.Contains(p[cityIdx], "电信") &&
+		!strings.Contains(p[cityIdx], "铁通") && !strings.Contains(p[cityIdx], "广电网") {
+		city = p[cityIdx]
+		if !strings.HasSuffix(city, "市") && !strings.HasSuffix(city, "盟") && !strings.HasSuffix(city, "州") {
+			city += "市"
 		}
 	}
 	return province, city, isp

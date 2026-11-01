@@ -1,5 +1,9 @@
 package main
 
+// dot import 是**文件级**的：main.go 里的 `import . "lemondb/norm"` 不会传染到这个
+// 测试文件，早先这里直接调 Parse360Region 所以 `go test .` 一直编译不过。
+import . "lemondb/norm"
+
 import "testing"
 
 func TestParse360Region(t *testing.T) {

@@ -13,4 +13,21 @@ scanner/*state*.json
 *.exe
 readback/
 tcapig.py
+teo.py
+teo-conf.json
 *.exe~
+# 扫描日志与中间产物
+scanner/log-*.txt
+scanner/archive/
+# 外部克隆的坐标表（CI 里现 clone，本地按需拉）
+divcoords/
+# 数据包
+*.zst
+# 本轮扫描的临时运维脚本与分片状态（入库只留 run_all / run_v4_final）
+scanner/st*.json
+scanner/monitor*.sh
+scanner/monitor*.log
+scanner/restart_v4*.sh
+scanner/resume_v4.sh
+scanner/probe_v6*.py
+topup_v6.py
