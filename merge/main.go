@@ -419,6 +419,7 @@ func main() {
 	cnMMDB := flag.String("cn-mmdb", "dbs/GeoLite2-City.mmdb", "判国家的库：非中国大陆的扫描段一律丢弃")
 	zxPath := flag.String("zx", "dbs/ipv6wry.db", "ZX ipv6wry，给 v6 段补市（省必须一致）")
 	geoPath := flag.String("geocn", "dbs/GeoCN.mmdb", "GeoCN 本地库：宽段按 /24 重算区县")
+	prevPath := flag.String("prev", "", "上一版的库（CN-LOCATION 或 LEMON-LOCATION 均可）：v6 区县蒸馏源。TEO 退出后新扫描基本产不出 v6 县，从上一版把县回收到新版")
 	flag.Parse()
 
 	loadDivision(*divisionFile)
@@ -740,8 +741,205 @@ func main() {
 		panic(err)
 	}
 	fout.Close()
+
+	// 蒸馏上一版：TEO 退出 CI 后，新扫描的 v6 基本只剩省/市，县级会一代代流失。
+	// 把上一版库里「新版没有县、上一版有县」的 v6 前缀回收回来——省必须一致、
+	// 市冲突时放弃（宁缺勿错），这是保精度不是覆盖。
+	if *prevPath != "" {
+		if n := distillPrev(tree, *out, *prevPath); n > 0 {
+			// 把蒸馏结果重新落盘
+			fout, err := os.Create(*out)
+			if err != nil {
+				panic(err)
+			}
+			if _, err := tree.WriteTo(fout); err != nil {
+				panic(err)
+			}
+			fout.Close()
+			fmt.Printf("蒸馏上一版 v6 区县: %d 个前缀\n", n)
+		} else {
+			fmt.Println("蒸馏上一版: 没有可回收的 v6 区县")
+		}
+	}
+
 	st, _ := os.Stat(*out)
 	fmt.Printf("%s 完成: %.2f MB\n", *out, float64(st.Size())/1048576)
+}
+
+// mergeRec merge 自产记录的读取视图（与扫描段入库时构造的字段一一对应）
+type mergeRec struct {
+	Country struct {
+		ISOCode string            `maxminddb:"iso_code"`
+		Names   map[string]string `maxminddb:"names"`
+	} `maxminddb:"country"`
+	Subdivisions []struct {
+		ISOCode string            `maxminddb:"iso_code"`
+		Names   map[string]string `maxminddb:"names"`
+	} `maxminddb:"subdivisions"`
+	City struct {
+		Names map[string]string `maxminddb:"names"`
+	} `maxminddb:"city"`
+	District struct {
+		Names map[string]string `maxminddb:"names"`
+	} `maxminddb:"district"`
+	DivisionCode uint32 `maxminddb:"division_code"`
+	ISP          string `maxminddb:"isp"`
+	Type         string `maxminddb:"type"`
+}
+
+// zhName 记录取名：zh-CN 优先，en 兜底
+func zhName(m map[string]string) string {
+	if v, ok := m["zh-CN"]; ok && v != "" {
+		return v
+	}
+	return m["en"]
+}
+
+// prefixMid v6 前缀的中点地址（用于到上一版库里查同一位置的记录）
+func prefixMid(p netip.Prefix) netip.Addr {
+	addr := p.Addr().As16()
+	bit := p.Bits()
+	if bit >= 128 {
+		return netip.AddrFrom16(addr)
+	}
+	addr[bit/8] |= 1 << (7 - uint(bit)%8) // 置位中点所在的那个 bit
+	return netip.AddrFrom16(addr)
+}
+
+// prefixToIPNet netip.Prefix → *net.IPNet（全部按 v6 处理，本函数只喂 v6）
+func prefixToIPNet(p netip.Prefix) *net.IPNet {
+	b := p.Addr().As16()
+	return &net.IPNet{IP: net.IP(b[:]), Mask: net.CIDRMask(p.Bits(), 128)}
+}
+
+// recToMap mergeRec → 写库记录（与扫描段入库的构造保持一致）
+func recToMap(m mergeRec) mmdbtype.Map {
+	rec := mmdbtype.Map{
+		"country": mmdbtype.Map{
+			"iso_code": mmdbtype.String(m.Country.ISOCode),
+			"names":    mmdbtype.Map{"zh-CN": mmdbtype.String(zhName(m.Country.Names)), "en": mmdbtype.String(m.Country.Names["en"])},
+		},
+		"isp":  mmdbtype.String(m.ISP),
+		"type": mmdbtype.String(m.Type),
+	}
+	if len(m.Subdivisions) > 0 {
+		sub := mmdbtype.Map{"names": mmdbtype.Map{"zh-CN": mmdbtype.String(zhName(m.Subdivisions[0].Names)), "en": mmdbtype.String(m.Subdivisions[0].Names["en"])}}
+		if m.Subdivisions[0].ISOCode != "" {
+			sub["iso_code"] = mmdbtype.String(m.Subdivisions[0].ISOCode)
+		}
+		rec["subdivisions"] = mmdbtype.Slice{sub}
+	}
+	if c := zhName(m.City.Names); c != "" {
+		rec["city"] = mmdbtype.Map{"names": mmdbtype.Map{"zh-CN": mmdbtype.String(c)}}
+	}
+	if d := zhName(m.District.Names); d != "" {
+		rec["district"] = mmdbtype.Map{"names": mmdbtype.Map{"zh-CN": mmdbtype.String(d)}}
+	}
+	if m.DivisionCode != 0 {
+		rec["division_code"] = mmdbtype.Uint32(m.DivisionCode)
+	}
+	return rec
+}
+
+// distillPrev 从上一版库回收 v6 区县，返回回收的前缀数。
+//
+// 遍历方向是「上一版」而非新版：上一版有县的 v6 前缀就那几千个（TEO 时期的存量），
+// 逐个拿出来，到新版里查同一位置的基底记录，把县（必要时连同市/区划码）补上，
+// 按上一版的前缀粒度插回树里——新版叶子更粗时，插入会自然把带县的子段切出来。
+//
+// 安全闸门：
+//   - 新版该位置已有县 → 不碰
+//   - 省对不上 → 放弃（上一版的县不能挂到别的省）
+//   - 两版市都有但冲突 → 放弃（宁缺勿错）
+func distillPrev(tree *mmdbwriter.Tree, outPath, prevPath string) int {
+	newDB, err := maxminddb.Open(outPath)
+	if err != nil {
+		fmt.Println("蒸馏: 打不开新版库:", err)
+		return 0
+	}
+	defer newDB.Close()
+	prevDB, err := maxminddb.Open(prevPath)
+	if err != nil {
+		fmt.Println("蒸馏: 打不开上一版库:", err)
+		return 0
+	}
+	defer prevDB.Close()
+
+	n := 0
+	var cLeaf, cNotCN, cNoCounty, cNewErr, cNewEmpty, cNotCNNew, cHasCounty, cProvMismatch, cCityMismatch, cInserted int
+	for res := range prevDB.Networks() {
+		pfx := res.Prefix()
+		if pfx.Addr().Is4() {
+			continue // 只蒸馏 v6：v4 有 360 撑着，不需要抢救
+		}
+		cLeaf++
+		var p mergeRec
+		if res.Decode(&p) != nil {
+			continue
+		}
+		if p.Country.ISOCode != "CN" {
+			cNotCN++
+			continue
+		}
+		if zhName(p.District.Names) == "" {
+			cNoCounty++
+			continue // 上一版这条就没县
+		}
+		if len(p.Subdivisions) == 0 {
+			cNoCounty++
+			continue
+		}
+
+		// 新版同位置的基底记录
+		lookup := newDB.Lookup(prefixMid(pfx))
+		var rec mergeRec
+		if !lookup.Found() {
+			// 新版这里完全没数据（floor 覆盖不到的 v6 区域）：整条从上一版搬。
+			// 能走到这的记录都是 CN+省+县齐全的，直接落地。
+			if err := tree.Insert(prefixToIPNet(pfx), recToMap(p)); err == nil {
+				n++
+				cNewEmpty++
+			}
+			continue
+		}
+		if err := lookup.Decode(&rec); err != nil {
+			cNewErr++
+			continue
+		}
+		if rec.Country.ISOCode != "CN" {
+			cNotCNNew++
+			continue
+		}
+		if zhName(rec.District.Names) != "" {
+			cHasCounty++
+			continue // 新版自己就有县，不碰
+		}
+		if len(rec.Subdivisions) == 0 || zhName(rec.Subdivisions[0].Names) != zhName(p.Subdivisions[0].Names) {
+			cProvMismatch++
+			continue // 省对不上：上一版的县不能挂到别的省
+		}
+		newCity, prevCity := zhName(rec.City.Names), zhName(p.City.Names)
+		if newCity != "" && prevCity != "" && newCity != prevCity {
+			cCityMismatch++
+			continue // 市冲突：宁缺勿错
+		}
+
+		m := rec
+		m.District = p.District
+		if newCity == "" {
+			m.City = p.City
+		}
+		if m.DivisionCode == 0 {
+			m.DivisionCode = p.DivisionCode
+		}
+		if err := tree.Insert(prefixToIPNet(pfx), recToMap(m)); err == nil {
+			n++
+			cInserted++
+		}
+	}
+	fmt.Printf("蒸馏明细: 上一版 v6 叶 %d / 无县 %d / 非CN %d / 新版空位 %d / 新版查错 %d / 新版非CN %d / 新版已有县 %d / 省不符 %d / 市冲突 %d / 回收 %d\n",
+		cLeaf, cNoCounty, cNotCN, cNewEmpty, cNewErr, cNotCNNew, cHasCounty, cProvMismatch, cCityMismatch, cInserted)
+	return n
 }
 
 // spanOf 地址跨度（用于排序，v4/v6 各自按自身数值比较即可）

@@ -169,13 +169,23 @@ jobs:
           done
           test -f divcoords/division-coords.json
 
+      # 上一版全球库当蒸馏源：TEO 退出后新扫描产不出 v6 县，从上一版回收。
+      # 首次构建没有 latest release 时下载失败不阻塞（跳过蒸馏而已）。
+      - name: 上一版库（蒸馏源）
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download latest -p LEMON-LOCATION.mmdb -O LEMON-LOCATION.prev.mmdb --clobber
+
+      # 无扫描段（skip_scan）时也跑 merge：底线 + 蒸馏出一份可用的 CN 库
       - name: merge
-        if: steps.segs.outputs.found == 'true'
         run: |
           ( cd merge && go build -o merge . )
+          PREV=""
+          [ -f LEMON-LOCATION.prev.mmdb ] && PREV="-prev LEMON-LOCATION.prev.mmdb"
           ./merge/merge -floor floor.jsonl -segs "scanner/seg-v*.jsonl" \
             -division dbs/full.txt -zx dbs/ipv6wry.db -geocn dbs/GeoCN.mmdb \
-            -out CN-LOCATION.mmdb
+            $PREV -out CN-LOCATION.mmdb
 
       - name: world
         if: steps.segs.outputs.found == 'true'

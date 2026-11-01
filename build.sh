@@ -57,9 +57,15 @@ merge_run() {
   echo "== merge: 覆盖底线 =="
   ( cd merge && go build -o merge$EXE . )
   # -zx 给 v6 补市、-geocn 让宽段按 /24 重算区县（缺这两个产物会退回低保真版本）
+  # PREV=上一版的库路径：v6 区县蒸馏（TEO 退出后防 v6 县代际流失），如 PREV=LEMON-LOCATION.mmdb ./build.sh merge
+  PREV_ARG=""
+  if [ -n "${PREV:-}" ] && [ -f "$PREV" ]; then
+    PREV_ARG="-prev $PREV"
+    echo "蒸馏源: $PREV"
+  fi
   ./merge/merge$EXE -floor floor.jsonl -segs "scanner/seg-v*.jsonl" \
     -division dbs/full.txt -zx dbs/ipv6wry.db -geocn dbs/GeoCN.mmdb \
-    -out CN-LOCATION.mmdb
+    $PREV_ARG -out CN-LOCATION.mmdb
 }
 
 world_run() {
