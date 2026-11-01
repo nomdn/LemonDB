@@ -1,0 +1,16 @@
+*.mmdb
+*.gz
+inetnum
+inet6num
+aut-num
+route
+route6
+floor.jsonl
+dbs/
+scanner/dbs/
+scanner/*.jsonl
+scanner/*state*.json
+*.exe
+readback/
+tcapig.py
+*.exe~
