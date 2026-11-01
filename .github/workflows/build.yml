@@ -94,18 +94,6 @@ jobs:
           name: cover
           path: dbs
 
-      # TEO 控制台会话是可选源：没有 secret 就只靠 bilibili / 360 / 本地库
-      - name: 写入 TEO 凭据（可选）
-        env:
-          TEO_CONF: ${{ secrets.TEO_CONF }}
-        run: |
-          if [ -n "${TEO_CONF:-}" ]; then
-            printf '%s' "$TEO_CONF" > teo-conf.json
-            echo "TEO 凭据已写入"
-          else
-            echo "无 TEO 凭据，跳过该源"
-          fi
-
       # runner 只有 4 核，12 进程只会把 360 打到限流，这里压到 6 进程
       - name: 扫描
         env:

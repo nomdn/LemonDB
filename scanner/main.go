@@ -713,6 +713,17 @@ func (s *scanner) scanPrefix(cidr string, out *bufio.Writer, v4 bool, gran int) 
 		if chunkSize.Sign() == 0 {
 			chunkSize = big.NewInt(1)
 		}
+		// 小前缀防退化：pfxBudget 大于块总数时 share=1，/24 会被切成 256 个
+		// 逐地址块（一枪一个 IP，一个 /24 烧 256 发探针，4238 个 /24 就是
+		// 百万级请求）。块最小压到 32 个地址——/24 即 8 块，采样密度与主扫描
+		// 「一个 /24 一格」对齐；大前缀的 chunkSize 远大于 32，不受影响。
+		if chunkSize.Cmp(big.NewInt(32)) < 0 && width == 4 {
+			chunkSize = big.NewInt(32)
+			nChunks = new(big.Int).Div(size, chunkSize)
+			if nChunks.Sign() == 0 {
+				nChunks = big.NewInt(1)
+			}
+		}
 
 		// ---- TEO 采样普查 ----
 		// 远程源单次 3 秒时逐块探针完全不划算（一个 /24 要 13 分钟），
