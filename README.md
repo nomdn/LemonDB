@@ -4,7 +4,7 @@
 
 | 产物 | 内容 | 覆盖 |
 |---|---|---|
-| `LEMON-LOCATION.mmdb` | 全球：国家 / 省 / 市 / 区县 + 经纬度（国内 GCJ-02、境外 WGS-84）；中国大陆含运营商 / 网络类型 / GB/T 2260 区划码 | 575 万条 maxmind 打底 + CN 高精度层覆盖 |
+| `LEMON-LOCATION.mmdb` | 全球：国家 / 省 / 市 / 区县 + 经纬度（**统一 WGS-84**，境内境外一个坐标系，上高德底图由读方自转 GCJ）；中国大陆含运营商 / 网络类型 / GB/T 2260 区划码 | 575 万条 maxmind 打底 + CN 高精度层覆盖 |
 | `LEMON-ASN.mmdb` | 全球自治系统号 + 组织名 | GeoLite2-ASN 打底 + APNIC CN 精修，约 117 万前缀 |
 
 `CN-LOCATION.mmdb` / `CN-ASN.mmdb` 是构建中间产物（仅中国大陆、CN 层原始形态），不对外发布。

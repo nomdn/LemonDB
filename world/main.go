@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -154,11 +155,68 @@ func baseToMMDB(r baseRec) (mmdbtype.Map, bool) {
 }
 
 // ---------- 行政区划坐标表（division-coords） ----------
+//
+// 坐标系统一：库里全部存 WGS-84（国际标准）。division-coords 采集自高德（GCJ-02），
+// 加载时统一转回 WGS-84——火星坐标对境外没有定义，「境内 GCJ / 境外 WGS」的混搭
+// 已废弃，读方不再需要区分 coord_system，前端上高德瓦片时自己转 GCJ。
 
 type coordTable struct {
 	county map[uint32][2]float64 // 六位区县，直接取政府驻地
 	city   map[uint32][2]float64 // XXYY00，下辖区县质心
 	prov   map[uint32][2]float64 // XX0000，优先省会 XX0100 的质心
+}
+
+// gcj02ToWgs84 火星坐标 → WGS-84，迭代逆解（3 轮收敛到亚米级）。
+// 境外输入原样返回（GCJ 变换只定义在中国境内，出界不折腾）。
+func gcj02ToWgs84(lng, lat float64) (float64, float64) {
+	wgsLng, wgsLat := lng, lat
+	for i := 0; i < 3; i++ {
+		gLng, gLat := wgs84ToGcj02(wgsLng, wgsLat)
+		wgsLng -= gLng - lng
+		wgsLat -= gLat - lat
+	}
+	return wgsLng, wgsLat
+}
+
+const (
+	gcjA  = 6378245.0             // 克拉索夫斯基椭球长半轴
+	gcjEE = 0.00669342162296594323 // 第一偏心率的平方
+)
+
+func outOfChina(lng, lat float64) bool {
+	return lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271
+}
+
+// wgs84ToGcj02 标准 GCJ-02 正向变换（逆解的内核）
+func wgs84ToGcj02(lng, lat float64) (float64, float64) {
+	if outOfChina(lng, lat) {
+		return lng, lat
+	}
+	dLat := transformLat(lng-105.0, lat-35.0)
+	dLng := transformLng(lng-105.0, lat-35.0)
+	radLat := lat / 180.0 * math.Pi
+	magic := math.Sin(radLat)
+	magic = 1 - gcjEE*magic*magic
+	sqrtMagic := math.Sqrt(magic)
+	dLat = (dLat * 180.0) / ((gcjA * (1 - gcjEE)) / (magic * sqrtMagic) * math.Pi)
+	dLng = (dLng * 180.0) / (gcjA / sqrtMagic * math.Cos(radLat) * math.Pi)
+	return lng + dLng, lat + dLat
+}
+
+func transformLat(x, y float64) float64 {
+	ret := -100.0 + 2.0*x + 3.0*y + 0.2*y*y + 0.1*x*y + 0.2*math.Sqrt(math.Abs(x))
+	ret += (20.0*math.Sin(6.0*x*math.Pi) + 20.0*math.Sin(2.0*x*math.Pi)) * 2.0 / 3.0
+	ret += (20.0*math.Sin(y*math.Pi) + 40.0*math.Sin(y/3.0*math.Pi)) * 2.0 / 3.0
+	ret += (160.0*math.Sin(y/12.0*math.Pi) + 320.0*math.Sin(y*math.Pi/30.0)) * 2.0 / 3.0
+	return ret
+}
+
+func transformLng(x, y float64) float64 {
+	ret := 300.0 + x + 2.0*y + 0.1*x*x + 0.1*x*y + 0.1*math.Sqrt(math.Abs(x))
+	ret += (20.0*math.Sin(6.0*x*math.Pi) + 20.0*math.Sin(2.0*x*math.Pi)) * 2.0 / 3.0
+	ret += (20.0*math.Sin(x*math.Pi) + 40.0*math.Sin(x/3.0*math.Pi)) * 2.0 / 3.0
+	ret += (150.0*math.Sin(x/12.0*math.Pi) + 300.0*math.Sin(x/30.0*math.Pi)) * 2.0 / 3.0
+	return ret
 }
 
 func loadCoords(path string) *coordTable {
@@ -192,7 +250,9 @@ func loadCoords(path string) *coordTable {
 			continue
 		}
 		c := uint32(code)
-		t.county[c] = v
+		// 源数据是高德采集的 GCJ-02，入库前统一转 WGS-84（见文件头「坐标系统一」）
+		wLng, wLat := gcj02ToWgs84(v[0], v[1])
+		t.county[c] = [2]float64{wLng, wLat}
 		cc, pc := c/100*100, c/10000*10000
 		if cur, ok := minCounty[cc]; !ok || c < cur {
 			minCounty[cc] = c
@@ -201,8 +261,8 @@ func loadCoords(path string) *coordTable {
 			provAcc[pc] = &acc{}
 		}
 		provAcc[pc].n++
-		provAcc[pc].lng += v[0]
-		provAcc[pc].lat += v[1]
+		provAcc[pc].lng += wLng
+		provAcc[pc].lat += wLat
 	}
 	for cc, minCode := range minCounty {
 		t.city[cc] = t.county[minCode]
@@ -464,7 +524,7 @@ func main() {
 						"latitude":        mmdbtype.Float64(lat),
 						"longitude":       mmdbtype.Float64(lng),
 						"accuracy_radius": mmdbtype.Uint32(radius),
-						"coord_system":    mmdbtype.String("gcj02"),
+						"coord_system":    mmdbtype.String("wgs84"),
 					}
 				}
 				insert(res.Prefix(), rec)
