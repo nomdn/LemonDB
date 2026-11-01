@@ -170,8 +170,8 @@ CN 段覆盖时用 `division_code` 查 `divcoords/division-coords.json` 拿政�
 
 ```
 LEMON-LOCATION.mmdb 57.4 MB  maxmind 5,757,408 条 + CN 层 373,732 段
-LEMON-ASN.mmdb      ~11 MB   GeoLite2-ASN 1,101,739 + APNIC CN 68,277 前缀
-CN-LOCATION.mmdb     3.14 MB  v4 283,466 前缀（省 100% / 市 99.5% / 县 70.5%）
+LEMON-ASN.mmdb      13 MB    GeoLite2-ASN 1,101,739 + APNIC CN 68,277 前缀
+CN-LOCATION.mmdb     3.17 MB  v4 288,035 前缀（省 100% / 市 99.5% / 县 70.9%）
                              v6  90,266 前缀（省 100% / 市 88.1% / 县  5.6%）
 CN-ASN.mmdb          1.5 MB  v4 46,405 / v6 21,873 前缀，去重 11,862 个 ASN
 ```
